@@ -28,6 +28,7 @@ A lightweight Obsidian plugin that lets you mention people with `@`, just like y
 - **Auto-create files** — optionally create person files and folders on the fly when selecting a suggestion
 - **Flexible folder modes** — store people as flat files, per-person folders, or grouped by last name
 - **Styleable links** — person links get the `at-person` CSS class and a `data-at-person` attribute in both Reading view and Live Preview, so you can format them with your own CSS (e.g. as `@`-pills); an optional built-in pill style is included
+- **Contact import (VCF)** — turn a vCard (`.vcf`) export into person notes in one step; each contact becomes a note with its details written to the frontmatter as properties, using a configurable template (phone, email, organization, title, birthday, address, website, note)
 
 ## Installation
 
@@ -199,6 +200,34 @@ Some plugins conflict with the `@` symbol. Check the [known plugin conflicts](ht
 | File templates | No | Yes |
 
 Choose **At People** if you want a fast, focused solution for person linking. Choose **At Symbol Linking** if you need broader symbol-to-folder mapping.
+
+## Contact import
+
+Turn a vCard (`.vcf`) export from your phone or contacts app into person notes in one step. Each contact becomes a note in your people folder (respecting your **Folder mode** and **Require @ prefix** settings) with its details written to the note's frontmatter as properties.
+
+### Contact template
+
+The **Contact template** setting (under **Contact import**) controls which vCard fields become note properties. It uses `{{TOKEN}}` placeholders that map to vCard fields:
+
+- `{{TEL}}` — phone numbers (multiple numbers are joined)
+- `{{EMAIL}}` — email addresses
+- `{{ORG}}` — organization
+- `{{TITLE}}` — job title
+- `{{BDAY}}` — birthday
+- `{{ADR}}` — postal address
+- `{{URL}}` — website / social profile
+- `{{NOTE}}` — the contact's note
+
+Lines whose token has no value for a given contact are skipped automatically, so each person note only contains the properties it actually has. The contact's name (from `FN`, falling back to `N`) becomes the note title, not a property — edit the template to remove any line you don't want.
+
+### Importing
+
+Use the **Import contacts from VCF** command (or the **Import from VCF** button in settings) to open the importer. You can either:
+
+- paste vCard text directly into the box, or
+- choose a `.vcf` file that already lives in your vault.
+
+Existing person files (same name) are skipped, and a Notice reports how many contacts were imported. After import, the new people appear in `@` suggestions immediately.
 
 ## Contributing
 

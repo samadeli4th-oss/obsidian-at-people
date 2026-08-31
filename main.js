@@ -1,4 +1,4 @@
-const { AbstractInputSuggest, EditorSuggest, SuggestModal, Notice, Plugin, PluginSettingTab, Setting, editorLivePreviewField, editorInfoField } = require('obsidian')
+const { AbstractInputSuggest, EditorSuggest, SuggestModal, Notice, Plugin, PluginSettingTab, Setting, Modal, editorLivePreviewField, editorInfoField } = require('obsidian')
 // CodeMirror 6 APIs used to tag person links in Live Preview (the editor view).
 // Obsidian bundles these modules, so they resolve at runtime via require().
 const { ViewPlugin, Decoration } = require('@codemirror/view')
@@ -20,6 +20,16 @@ const DEFAULT_SETTINGS = {
 	useAliases: false,
 	aliasDisplayMode: 'off', // 'off' | 'always' | 'matched'
 	enablePillStyle: false,
+	contactTemplate: [
+		'phone: {{TEL}}',
+		'email: {{EMAIL}}',
+		'organization: {{ORG}}',
+		'title: {{TITLE}}',
+		'birthday: {{BDAY}}',
+		'address: {{ADR}}',
+		'website: {{URL}}',
+		'note: {{NOTE}}',
+	].join('\n'),
 }
 
 // Regex to extract person name from file path
@@ -129,6 +139,111 @@ const getPersonName = (filename, settings) => {
 	const name = match[1]
 	return name.startsWith('@') ? name.slice(1) : name
 }
+// --- Contact (VCF / vCard) import helpers ---
+
+// Join a vCard's folded continuation lines (those starting with space/tab).
+function unfoldVcf(text) {
+	const raw = text.split(/\r\n|\r|\n/)
+	const out = []
+	for (const line of raw) {
+		if (/^[ \t]/.test(line) && out.length) {
+			out[out.length - 1] += line.slice(1)
+		} else {
+			out.push(line)
+		}
+	}
+	return out
+}
+
+// Decode ENCODING=QUOTED-PRINTABLE / BASE64 and undo vCard escaping.
+function decodeVcfValue(left, value) {
+	const params = left.split(';').slice(1)
+	let enc = ''
+	for (const p of params) {
+		const m = p.match(/^ENCODING=(.+)$/i)
+		if (m) enc = m[1].toUpperCase()
+	}
+	if (enc === 'QUOTED-PRINTABLE' || enc === 'Q' || enc === 'QUOTED') {
+		value = value
+			.replace(/=\r?\n/g, '')
+			.replace(/=([0-9A-F]{2})/gi, (_, h) => String.fromCharCode(parseInt(h, 16)))
+	} else if (enc === 'B' || enc === 'BASE64') {
+		try { value = decodeURIComponent(escape(atob(value.replace(/\s+/g, '')))) } catch (e) { /* keep raw */ }
+	}
+	return value
+		.replace(/\\n/gi, '\n')
+		.replace(/\\t/gi, ' ')
+		.replace(/\\([,;\\])/g, '$1')
+}
+
+// Parse one or more vCards from a string into contact objects.
+function parseVcf(text) {
+	const cards = []
+	const blocks = text.split(/END:VCARD/i)
+	for (const block of blocks) {
+		if (!/BEGIN:VCARD/i.test(block)) continue
+		const lines = unfoldVcf(block)
+		const collected = {}
+		let fn = ''
+		for (const line of lines) {
+			if (!line || !line.includes(':')) continue
+			const idx = line.indexOf(':')
+			const left = line.slice(0, idx)
+			let value = line.slice(idx + 1)
+			let prop = left.split(';')[0].toUpperCase()
+			if (prop.includes('.')) prop = prop.split('.').pop()
+			value = decodeVcfValue(left, value).trim()
+			if (prop === 'FN') {
+				if (!fn) fn = value
+			} else if (prop === 'N') {
+				const parts = value.split(';')
+				const full = [parts[1], parts[2], parts[0]]
+					.map(p => (p || '').trim())
+					.filter(Boolean)
+					.join(' ')
+				if (!fn) fn = full
+			} else {
+				if (!collected[prop]) collected[prop] = []
+				collected[prop].push(value)
+			}
+		}
+		if (!fn) continue
+		const fields = {}
+		for (const k in collected) fields[k] = collected[k].join('; ')
+		cards.push({ name: fn, fields })
+	}
+	return cards
+}
+
+// Quote a string so it is safe as a YAML frontmatter scalar.
+function yamlValue(v) {
+	const s = String(v).replace(/\r?\n/g, ' ').trim()
+	return '"' + s.replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"'
+}
+
+// Render the user's contact template for one contact, skipping lines whose
+// {{TOKEN}} has no value. Lines without a token are kept verbatim.
+function renderContactTemplate(template, fields) {
+	const out = []
+	for (const line of (template || '').split('\n')) {
+		if (!line.trim()) continue
+		const m = line.match(/^([\w-]+)\s*:\s*(.*)$/)
+		if (!m) { out.push(line); continue }
+		const key = m[1]
+		let rest = m[2]
+		let unresolved = false
+		const replaced = rest.replace(/\{\{\s*(\w+)\s*\}\}/g, (_, t) => {
+			const v = fields[t]
+			if (v == null || v === '') { unresolved = true; return '' }
+			return v
+		})
+		if (unresolved) continue
+		const value = replaced.trim()
+		if (value === '') continue
+		out.push(`${key}: ${yamlValue(value)}`)
+	}
+	return out.join('\n')
+}
 
 module.exports = class AtPeople extends Plugin {
 	async onload() {
@@ -179,6 +294,15 @@ module.exports = class AtPeople extends Plugin {
 			}
 		})
 		
+		// Command to import contacts from a VCF (vCard) file
+		this.addCommand({
+			id: 'import-contacts-vcf',
+			name: 'Import contacts from VCF',
+			callback: () => {
+				new VcfImportModal(this.app, this).open()
+			}
+		})
+
 		this.app.workspace.onLayoutReady(this.initialize)
 	}
 
@@ -352,16 +476,7 @@ module.exports = class AtPeople extends Plugin {
 		}
 
 		// Determine target folder and file path based on folder mode
-		let targetFolder = normalizeFolder(this.settings.peopleFolder)
-		let filePath = targetFolder + filename
-
-		if (this.settings.folderMode === "PER_PERSON") {
-			targetFolder = normalizeFolder(this.settings.peopleFolder) + `${atPrefix}${display}/`
-			filePath = targetFolder + filename
-		} else if (this.settings.folderMode === "PER_LASTNAME") {
-			targetFolder = normalizeFolder(this.settings.peopleFolder) + (lastName ? lastName + '/' : '')
-			filePath = targetFolder + filename
-		}
+		const { filePath, targetFolder } = this.getPersonFilePath(display)
 
 		// Auto-create folders and files if enabled
 		if (this.settings.autoCreateFiles) {
@@ -385,6 +500,52 @@ module.exports = class AtPeople extends Plugin {
 		}
 
 		return link
+	}
+	// Compute the target folder and file path for a person name, honoring the
+	// folder mode and @-prefix settings. Shared by link creation and VCF import.
+	getPersonFilePath(display) {
+		const lastNameMatch = LAST_NAME_REGEX.exec(display)
+		const lastName = lastNameMatch && lastNameMatch[1] ? lastNameMatch[1] : ''
+		const atPrefix = this.settings.requireAtPrefix ? '@' : ''
+		const filename = `${atPrefix}${display}.md`
+		let targetFolder = normalizeFolder(this.settings.peopleFolder)
+		let filePath = targetFolder + filename
+		if (this.settings.folderMode === "PER_PERSON") {
+			targetFolder = normalizeFolder(this.settings.peopleFolder) + `${atPrefix}${display}/`
+			filePath = targetFolder + filename
+		} else if (this.settings.folderMode === "PER_LASTNAME") {
+			targetFolder = normalizeFolder(this.settings.peopleFolder) + (lastName ? lastName + '/' : '')
+			filePath = targetFolder + filename
+		}
+		return { filePath, targetFolder }
+	}
+
+	// Parse vCard text and create one person note per contact, filling the
+	// frontmatter from the configured contact template. Skips duplicates and
+	// contacts with no resolvable name.
+	async importVcf(text) {
+		const contacts = parseVcf(text)
+		if (!contacts.length) {
+			new Notice('No contacts found in the VCF text.')
+			return
+		}
+		let created = 0
+		let skipped = 0
+		for (const contact of contacts) {
+			const name = normalizeNewPersonName(contact.name)
+			if (!name) { skipped++; continue }
+			const { filePath, targetFolder } = this.getPersonFilePath(name)
+			if (this.app.vault.getAbstractFileByPath(filePath)) { skipped++; continue }
+			const yaml = renderContactTemplate(this.settings.contactTemplate, contact.fields)
+			const content = yaml ? `---\n${yaml}\n---\n` : ''
+			try { await this.app.vault.createFolder(targetFolder.replace(/\/$/, '')) } catch (e) { /* exists */ }
+			try {
+				await this.app.vault.create(filePath, content)
+				created++
+			} catch (e) { skipped++ }
+		}
+		new Notice(`Imported ${created} contact(s). ${skipped} skipped (duplicates or missing name).`)
+		this.initialize()
 	}
 }
 
@@ -1193,6 +1354,36 @@ class AtPeopleSettingTab extends PluginSettingTab {
 				})
 			)
 
+		new Setting(containerEl).setName('Contact import').setHeading()
+		new Setting(containerEl)
+			.setName('Contact template')
+			.setDesc(multiLineDesc([
+				'Frontmatter written for each imported contact. Use {{TOKEN}} placeholders',
+				'that map to vCard fields: TEL, EMAIL, ORG, TITLE, BDAY, ADR, URL, NOTE.',
+				'Lines whose token has no value for a contact are skipped automatically.',
+				'The contact name (from FN or N) becomes the note title, not a property.'
+			]))
+			.addTextArea(text => {
+				text.setValue(this.plugin.settings.contactTemplate)
+					.onChange(async (value) => {
+						this.plugin.settings.contactTemplate = value
+						await this.plugin.saveSettings()
+					})
+				text.inputEl.rows = 9
+				text.inputEl.style.width = '100%'
+				text.inputEl.style.fontFamily = 'monospace'
+			})
+		new Setting(containerEl)
+			.setName('Import contacts from VCF')
+			.setDesc('Open the importer to paste vCard text or pick a .vcf file from your vault.')
+			.addButton(button => button
+				.setButtonText('Import from VCF')
+				.setCta()
+				.onClick(() => {
+					new VcfImportModal(this.app, this.plugin).open()
+				})
+			)
+
 		new Setting(containerEl)
 			.setName('Reset to defaults')
 			.setDesc('Restore every setting above to its default value.')
@@ -1217,5 +1408,93 @@ class AtPeopleSettingTab extends PluginSettingTab {
 						this.display()
 					})
 			})
+	}
+}
+
+
+/**
+ * Modal that lets the user import contacts from a vCard (.vcf) source.
+ * The user can either paste VCF text directly or choose a .vcf file already
+ * present in the vault. On import, the plugin parses the text and creates one
+ * person note per contact with frontmatter from the configured template.
+ */
+class VcfImportModal extends Modal {
+	constructor(app, plugin) {
+		super(app)
+		this.plugin = plugin
+		this.titleEl.setText('Import contacts from VCF')
+	}
+
+	onOpen() {
+		const { contentEl } = this
+		contentEl.createEl('p', {
+			text: 'Paste vCard (.vcf) text below, or choose a .vcf file from your vault.',
+		})
+
+		const textarea = contentEl.createEl('textarea')
+		textarea.style.width = '100%'
+		textarea.style.height = '220px'
+		textarea.style.fontFamily = 'monospace'
+		this.textarea = textarea
+
+		new Setting(contentEl)
+			.setName('Vault .vcf file')
+			.setDesc('Load VCF text from a file already in your vault.')
+			.addButton(button => button
+				.setButtonText('Choose file')
+				.onClick(() => {
+					new VcfFileSelectModal(this.app, (path) => {
+						const file = this.app.vault.getAbstractFileByPath(path)
+						if (file) {
+							this.app.vault.read(file).then(t => { textarea.value = t })
+						}
+					}).open()
+				})
+			)
+
+		const importButton = contentEl.createEl('button', { text: 'Import contacts' })
+		importButton.className = 'mod-cta'
+		importButton.style.marginTop = '12px'
+		importButton.addEventListener('click', () => {
+			const text = this.textarea.value.trim()
+			if (!text) {
+				new Notice('Paste VCF text or choose a file first.')
+				return
+			}
+			this.close()
+			this.plugin.importVcf(text)
+		})
+	}
+
+	onClose() {
+		this.contentEl.empty()
+	}
+}
+
+/**
+ * SuggestModal listing every .vcf file in the vault so the user can pick one
+ * to import.
+ */
+class VcfFileSelectModal extends SuggestModal {
+	constructor(app, onChoose) {
+		super(app)
+		this.onChoosePath = onChoose
+		this.files = app.vault.getFiles()
+			.filter(f => f.extension === 'vcf')
+			.map(f => f.path)
+		this.setPlaceholder('Search .vcf files in your vault...')
+	}
+
+	getSuggestions(query) {
+		const q = query.toLowerCase()
+		return this.files.filter(p => p.toLowerCase().includes(q))
+	}
+
+	renderSuggestion(path, el) {
+		el.createEl('div', { text: path })
+	}
+
+	onChooseSuggestion(path) {
+		this.onChoosePath(path)
 	}
 }

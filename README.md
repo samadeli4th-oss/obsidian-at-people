@@ -211,7 +211,8 @@ The **Contact template** setting (under **Contact import**) controls which vCard
 
 - `{{TEL}}` — phone numbers (multiple numbers are joined)
 - `{{EMAIL}}` — email addresses
-- `{{ORG}}` — company / organization
+- `{{ORG}}` — company / organization (first part of the vCard `ORG` field)
+- `{{DEPARTMENT}}` — department (second part of `ORG`, e.g. `Org;Dept`)
 - `{{TITLE}}` — job title
 - `{{BDAY}}` — birthday
 - `{{ADR}}` — postal address

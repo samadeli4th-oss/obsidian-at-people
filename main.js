@@ -24,6 +24,7 @@ const DEFAULT_SETTINGS = {
 		'phone: {{TEL}}',
 		'email: {{EMAIL}}',
 		'company: {{ORG}}',
+		'department: {{DEPARTMENT}}',
 		'job title: {{TITLE}}',
 		'birthday: {{BDAY}}',
 		'address: {{ADR}}',
@@ -190,6 +191,8 @@ function parseVcf(text) {
 		let last = ''
 		let photo = ''
 		let photoType = 'jpg'
+		let org = ''
+		let department = ''
 		for (const line of lines) {
 			if (!line || !line.includes(':')) continue
 			const idx = line.indexOf(':')
@@ -208,6 +211,18 @@ function parseVcf(text) {
 				if (!first) first = given
 				const full = [given, family].filter(Boolean).join(' ')
 				if (!fn) fn = full || value.split(';').filter(Boolean).join(' ')
+			} else if (prop === 'ORG') {
+				if (!org) {
+					const parts = value.split(';')
+					org = (parts[0] || '').trim()
+					department = (parts[1] || '').trim()
+				}
+				if (!collected['ORG']) collected['ORG'] = []
+				collected['ORG'].push(org)
+				if (department) {
+					if (!collected['DEPARTMENT']) collected['DEPARTMENT'] = []
+					collected['DEPARTMENT'].push(department)
+				}
 			} else if (prop === 'PHOTO') {
 				if (!photo) {
 					const isUri = /VALUE=uri/i.test(left) || /^https?:/i.test(rawValue) || /^data:/i.test(rawValue)
@@ -569,6 +584,7 @@ module.exports = class AtPeople extends Plugin {
 				TEL: c.fields.TEL || '',
 				EMAIL: c.fields.EMAIL || '',
 				ORG: c.fields.ORG || '',
+				DEPARTMENT: c.fields.DEPARTMENT || '',
 				TITLE: c.fields.TITLE || '',
 				BDAY: c.fields.BDAY || '',
 				ADR: c.fields.ADR || '',
